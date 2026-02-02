@@ -43,7 +43,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["AVSync_hook.py"],
     excludes=[
         'matplotlib',
         'IPython',
