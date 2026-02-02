@@ -19,11 +19,27 @@ interface BatchJobProps {
   onEditingIdChange?: (id: string | null) => void
 }
 
+const DEFAULT_PATTERNS = [
+  '\\.[^.]+$',
+  '\\[.*?\\]',
+  '(1080p|720p|4k)',
+  '(ptbr|eng|jap|jp)',
+  '[-_.\\s]'
+]
+
+const buildMatchKey = (filename: string, patterns: RegExp[]) => {
+  let key = filename.toLowerCase()
+  for (const p of patterns) key = key.replace(p, '')
+  return key.trim()
+}
+
 export default function BatchJob({ parameters, onAddToQueue, onJobsChange }: BatchJobProps) {
-  const [refFolder, setRefFolder] = useState<string>('')
-  const [foreignFolder, setForeignFolder] = useState<string>('')
-  const [outputFolder, setOutputFolder] = useState<string>('')
+  const [refFolder, setRefFolder] = useState('')
+  const [foreignFolder, setForeignFolder] = useState('')
+  const [outputFolder, setOutputFolder] = useState('')
   const [jobs, setJobs] = useState<BatchJobItem[]>([])
+  const [patterns, setPatterns] = useState<string[]>(DEFAULT_PATTERNS)
+  const [preview, setPreview] = useState<any[]>([])
 
   const handleSelectFolder = async (type: 'ref' | 'foreign' | 'output') => {
     const path = await window.electronAPI.selectDirectory()
@@ -44,25 +60,42 @@ export default function BatchJob({ parameters, onAddToQueue, onJobsChange }: Bat
       const refFiles = await window.electronAPI.listDirectory(refFolder)
       const foreignFiles = await window.electronAPI.listDirectory(foreignFolder)
 
-      // Filter video files
       const videoExtensions = ['.mkv', '.mp4', '.avi', '.mov', '.m4v']
       const refVideos = refFiles.filter(f =>
         videoExtensions.some(ext => f.toLowerCase().endsWith(ext))
-      ).sort()
+      )
       const foreignVideos = foreignFiles.filter(f =>
         videoExtensions.some(ext => f.toLowerCase().endsWith(ext))
-      ).sort()
+      )
 
-      // Match by exact filename
+      const regexes = patterns
+        .filter(Boolean)
+        .map(p => new RegExp(p, 'gi'))
+
+      const foreignMap = new Map<string, string>()
+      for (const f of foreignVideos) {
+        foreignMap.set(buildMatchKey(f, regexes), f)
+      }
+
       const matched: BatchJobItem[] = []
-      for (const refFile of refVideos) {
-        const matchingForeign = foreignVideos.find(f => f === refFile)
-        if (matchingForeign) {
+      const previewRows: any[] = []
+
+      for (const r of refVideos) {
+        const key = buildMatchKey(r, regexes)
+        const match = foreignMap.get(key)
+
+        previewRows.push({
+          ref: r,
+          foreign: match || null,
+          key
+        })
+
+        if (match) {
           matched.push({
             id: `batch-${Date.now()}-${Math.random()}`,
-            refVideo: `${refFolder}/${refFile}`,
-            foreignVideo: `${foreignFolder}/${matchingForeign}`,
-            outputVideo: `${outputFolder}/${refFile}`,
+            refVideo: `${refFolder}/${r}`,
+            foreignVideo: `${foreignFolder}/${match}`,
+            outputVideo: `${outputFolder}/${r}`,
             firstSegmentAdjust: parameters.firstSegmentAdjust || 0,
             lastSegmentAdjust: parameters.lastSegmentAdjust || 0,
             skipSubtitles: parameters.noSubtitles || false,
@@ -71,38 +104,28 @@ export default function BatchJob({ parameters, onAddToQueue, onJobsChange }: Bat
         }
       }
 
-      if (matched.length === 0) {
-        alert('No matching files found between reference and foreign folders')
-      } else {
-        setJobs(matched)
-        onJobsChange?.(matched)
-      }
-    } catch (error) {
-      console.error('Error loading jobs:', error)
+      setPreview(previewRows)
+      setJobs(matched)
+      onJobsChange?.(matched)
+    } catch (err) {
+      console.error(err)
       alert('Failed to load directory contents')
     }
   }
 
   const handleAddToQueue = () => {
-    if (jobs.length === 0) {
-      alert('No jobs to add to queue')
-      return
-    }
+    if (jobs.length === 0) return
     onAddToQueue(jobs)
     setJobs([])
+    setPreview([])
     onJobsChange?.([])
-    setRefFolder('')
-    setForeignFolder('')
-    setOutputFolder('')
   }
 
   return (
     <div className="batch-job">
+      {/* ================= Folder Selection (IGUAL AO ORIGINAL) ================= */}
       <div className="batch-folders">
         <h2 className="section-title">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-          </svg>
           Folder Selection
         </h2>
 
@@ -161,22 +184,62 @@ export default function BatchJob({ parameters, onAddToQueue, onJobsChange }: Bat
           onClick={handleLoadJobs}
           disabled={!refFolder || !foreignFolder || !outputFolder}
         >
-          Load Matched Files
+          Load / Preview Matches
+        </button>
+              {/* ================= Regex Editor ================= */}
+      <div className="folder-item">
+        <h3 className="section-title">Match Rules (Regex)</h3>
+
+        {patterns.map((p, i) => (
+          <input
+            key={i}
+            value={p}
+            onChange={e => {
+              const copy = [...patterns]
+              copy[i] = e.target.value
+              setPatterns(copy)
+            }}
+            className="folder-input"
+          />
+        ))}
+
+        <button className="btn-browse" onClick={() => setPatterns([...patterns, ''])}>
+          + Add Regex
         </button>
       </div>
 
-      {jobs.length > 0 && (
-        <div className="batch-info">
-          <p className="batch-info-text">
-            {jobs.length} job{jobs.length !== 1 ? 's' : ''} loaded. View and edit the staging table in the left panel, then add to queue.
-          </p>
-          <button className="btn-add-to-queue-bottom" onClick={handleAddToQueue}>
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M8 2v12M2 8h12" stroke="currentColor" strokeWidth="2"/>
-            </svg>
-            Add {jobs.length} Job{jobs.length !== 1 ? 's' : ''} to Queue
-          </button>
+      </div>
+
+
+      {/* ================= Preview ================= */}
+      {preview.length > 0 && (
+        <div className="preview">
+          <h3>Preview</h3>
+          <table className="preview-table">
+            <thead>
+              <tr>
+                <th>Reference</th>
+                <th>Foreign</th>
+                <th>Match Key</th>
+              </tr>
+            </thead>
+            <tbody>
+              {preview.map((p, i) => (
+                <tr key={i} className={!p.foreign ? 'no-match' : ''}>
+                  <td>{p.ref}</td>
+                  <td>{p.foreign || '❌ No match'}</td>
+                  <td>{p.key}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
+      )}
+
+      {jobs.length > 0 && (
+        <button className="btn-add-to-queue-bottom" onClick={handleAddToQueue}>
+          Add {jobs.length} Job{jobs.length !== 1 ? 's' : ''} to Queue
+        </button>
       )}
     </div>
   )
