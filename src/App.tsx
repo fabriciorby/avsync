@@ -46,7 +46,7 @@ function App() {
     matchThreshold: 0.7,
     similarityThreshold: 4,
     refLang: 'eng',
-    foreignLang: 'spa',
+    foreignLang: 'por',
     dbThreshold: -40.0,
     minSegmentDuration: 0.5,
     muxForeignCodec: 'aac',
