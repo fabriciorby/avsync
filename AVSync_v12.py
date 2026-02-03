@@ -1941,10 +1941,10 @@ def create_qc_images(visual_anchors_details, final_segment_anchors,
 
 def run_muxing(args, ref_stream_idx, synced_subtitles=None):
     """
-    Muxes the reference video with its original audio, the newly synced foreign audio, and synced subtitles.
-    Handles deletion of temporary audio files.
+    Muxes the reference video with ALL its original content (video, audio, subtitles, attachments),
+    PLUS the newly synced foreign audio and synced subtitles.
     """
-    if not args.output_video: # Check the required output video path
+    if not args.output_video:
         logger.error("No output video path specified. Cannot mux.")
         return False
     if not os.path.exists(args.output_audio):
@@ -1954,92 +1954,154 @@ def run_muxing(args, ref_stream_idx, synced_subtitles=None):
     logger.info("\n===== \1 =====")
     logger.info(f"  Reference Video Source: {os.path.basename(args.ref_video)}")
     logger.info(f"  Synced Foreign Audio:   {os.path.basename(args.output_audio)}")
-    logger.info(f"  Output Muxed Video:     {os.path.basename(args.output_video)}") # Use output_video
+    logger.info(f"  Output Muxed Video:     {os.path.basename(args.output_video)}")
 
-    # Reference audio stream index should have been determined in the sync stage
-    if ref_stream_idx is None:
-         logger.warning("Reference stream index not provided to muxing stage, attempting to find again.")
-         ref_streams = get_stream_info(args.ref_video)
-         ref_stream_idx = find_audio_stream_index_by_lang(ref_streams, args.ref_lang)
-         if ref_stream_idx is None:
-              logger.error("Could not determine reference audio stream index for muxing. Aborting mux.")
-              return False # Return False here so main knows muxing failed
-    logger.info(f"  Using Reference Audio Stream Index: {ref_stream_idx}")
-
-    # Construct FFmpeg command for muxing
+    # Get stream info to count original audio streams
+    ref_streams = get_stream_info(args.ref_video)
+    num_orig_audio = sum(1 for s in ref_streams if s['codec_type'] == 'audio')
+    
+    # Base command
     ffmpeg_cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-stats',
-        '-i', args.ref_video,              # Input 0: Reference video (contains video + original audio)
-        '-i', args.output_audio,           # Input 1: Synced foreign audio (WAV)
+        '-i', args.ref_video,              # Input 0: Reference video
+        '-i', args.output_audio            # Input 1: Synced foreign audio
     ]
-    
+
     # Add subtitle inputs
     if synced_subtitles:
-        for sub_info in synced_subtitles:
-            ffmpeg_cmd.extend(['-i', sub_info['path']])
+        for sub in synced_subtitles:
+            ffmpeg_cmd.extend(['-i', sub['path']])
         logger.info(f"  Including {len(synced_subtitles)} synced subtitle stream(s)")
-    
-    # Map streams
-    ffmpeg_cmd.extend([
-        '-map', '0:v:0',                   # Map video stream from Input 0
-        '-map', f'0:{ref_stream_idx}',     # Map reference audio
-        '-map', '1:a:0',                   # Map synced foreign audio stream from Input 1
-    ])
-    
-    # Map subtitle streams
+
+    # ---------------------------------------------------------
+    # STREAM MAPPING & LAYOUT
+    # ---------------------------------------------------------
+    # We will map streams in a clean order:
+    # 1. Video (0:v)
+    # 2. Original Audios (0:a)
+    # 3. New Synced Audio (1:a)
+    # 4. Original Subtitles (0:s)
+    # 5. New Synced Subtitles (2:s, 3:s...)
+    # 6. Attachments (0:t)
+
+    # 1. Video
+    ffmpeg_cmd.extend(['-map', '0:v'])
+
+    # 2. Original Audio
+    ffmpeg_cmd.extend(['-map', '0:a'])
+
+    # 3. New Audio (Input 1)
+    ffmpeg_cmd.extend(['-map', '1:a:0'])
+
+    # 4. Original Subtitles
+    ffmpeg_cmd.extend(['-map', '0:s?'])
+
+    # 5. New Subtitles
     if synced_subtitles:
-        for i, sub_info in enumerate(synced_subtitles):
-            sub_input_idx = i + 2  # 0=ref video, 1=audio, 2+=subtitles
+        for i in range(len(synced_subtitles)):
+            sub_input_idx = i + 2
             ffmpeg_cmd.extend(['-map', f'{sub_input_idx}:s'])
+
+    # 6. Attachments
+    ffmpeg_cmd.extend(['-map', '0:t?'])
+
+    # ---------------------------------------------------------
+    # CODEC SETTINGS
+    # ---------------------------------------------------------
     
-    # Codec settings
+    # 1. Video: Copy
+    ffmpeg_cmd.extend(['-c:v', 'copy'])
+    
+    # 2. Original Audio: Copy individually
+    # Output indices: 0 to num_orig_audio-1
+    for i in range(num_orig_audio):
+        ffmpeg_cmd.extend([f'-c:a:{i}', 'copy'])
+    
+    # 3. New Audio: Re-encode
+    # Output index: num_orig_audio
+    new_audio_out_idx = num_orig_audio
     ffmpeg_cmd.extend([
-        '-c:v', 'copy',                    # Copy video stream without re-encoding
-        '-c:a:0', 'copy',                  # Copy original reference audio without re-encoding
-        '-c:a:1', args.mux_foreign_codec,  # Codec for the second audio track (synced)
+        f'-c:a:{new_audio_out_idx}', args.mux_foreign_codec,
+        f'-b:a:{new_audio_out_idx}', args.mux_foreign_bitrate,
+        f'-ac:a:{new_audio_out_idx}', '2',
+        f'-ar:a:{new_audio_out_idx}', '48000'
     ])
 
-    # Add bitrate only if re-encoding
-    if args.mux_foreign_codec != 'copy':
-        ffmpeg_cmd.extend(['-b:a:1', args.mux_foreign_bitrate])
-    
-    # Add subtitle codec - use mov_text for MP4, srt for MKV
+    # 4. Original Subtitles: Copy individually
+    # Output indices: 0 to num_orig_subs-1 (relative to subtitle streams)
+    # Note: '-c:s' targets subtitle streams index.
+    # The first subtitle stream corresponds to the first mapped subtitle.
+    # We mapped '0:s' first, so indices 0..num_orig_subs-1 are original.
+    num_orig_subs = sum(1 for s in ref_streams if s['codec_type'] == 'subtitle')
+    for i in range(num_orig_subs):
+        ffmpeg_cmd.extend([f'-c:s:{i}', 'copy'])
+
+    # 5. New Subtitles: Transcode/Copy
     if synced_subtitles:
-        subtitle_codec = 'mov_text' if args.output_video.lower().endswith('.mp4') else 'srt'
-        ffmpeg_cmd.extend(['-c:s', subtitle_codec])
-        
-        # Add language metadata for subtitles
         for i, sub_info in enumerate(synced_subtitles):
-            ffmpeg_cmd.extend(['-metadata:s:s:{}'.format(i), f"language={sub_info['language']}"])
+            abs_sub_idx = num_orig_subs + i
+            
+            output_ext = os.path.splitext(args.output_video)[1].lower()
+            input_ext = os.path.splitext(sub_info['path'])[1].lower()
+            
+            sub_codec = 'copy'
+            if output_ext == '.mp4':
+                sub_codec = 'mov_text'
+            elif output_ext == '.mkv':
+                sub_codec = 'ass' if input_ext == '.ass' else 'srt'
+            
+            ffmpeg_cmd.extend([f'-c:s:{abs_sub_idx}', sub_codec])
+            
+            # Metadata for new subtitles
+            ffmpeg_cmd.extend([
+                f'-metadata:s:s:{abs_sub_idx}', f'language={sub_info["language"]}',
+                f'-metadata:s:s:{abs_sub_idx}', f'title=Synced {sub_info["language"]}',
+                f'-disposition:s:{abs_sub_idx}', '0'
+            ])
 
-    # Metadata (REMOVED language tags as requested)
+    # 6. Attachments: Copy
+    ffmpeg_cmd.extend(['-c:t', 'copy'])
+
+    # ---------------------------------------------------------
+    # METADATA & DISPOSITION (Audio)
+    # ---------------------------------------------------------
+    
+    # Unset default on original audios
+    for i in range(num_orig_audio):
+         ffmpeg_cmd.extend([f'-disposition:a:{i}', '0'])
+    
+    # Set new audio as default
     ffmpeg_cmd.extend([
-        # '-metadata:s:a:0', f'language={args.ref_lang}',  # Removed
-        # '-metadata:s:a:0', 'title=Original', # Optional: Add titles if desired
-        # '-disposition:s:a:0', 'default', # Optional: Set dispositions if desired
-        # '-metadata:s:a:1', f'language={args.foreign_lang}', # Removed
-        # '-metadata:s:a:1', 'title=Foreign Synced', # Optional
-        # '-disposition:s:a:1', '0', # Optional
-        '-y',
-        args.output_video
+        f'-metadata:s:a:{new_audio_out_idx}', f'language={args.foreign_lang}',
+        f'-metadata:s:a:{new_audio_out_idx}', f'title=Synced {args.foreign_lang}',
+        f'-disposition:a:{new_audio_out_idx}', 'default'
     ])
 
-    # Execute the muxing command
+    # ---------------------------------------------------------
+    # GLOBAL OPTIONS
+    # ---------------------------------------------------------
+    ffmpeg_cmd.extend(['-ignore_unknown'])
+    # Add buffer for complex muxing
+    ffmpeg_cmd.extend(['-max_interleave_delta', '0'])
+
+    # Output
+    ffmpeg_cmd.extend(['-y', args.output_video])
+
+    # ---------------------------------------------------------
+    # EXECUTION
+    # ---------------------------------------------------------
     success, _ = run_ffmpeg(ffmpeg_cmd, "Mux Final Video")
 
-    # Determine if the WAV file was temporary (i.e., not specified by user)
+    # Cleanup logic
     is_temp_wav = args.output_audio_original is None
-
-    # Attempt to delete the audio file *if* it was temporary, regardless of muxing success
     if os.path.exists(args.output_audio) and is_temp_wav:
         try:
             os.remove(args.output_audio)
             logger.info(f"  -> Deleted temporary audio file: {args.output_audio}")
         except Exception as e:
-            logger.warning(f"  Note: Could not delete temporary audio file '{args.output_audio}': {e}")
+            logger.warning(f"  Note: Could not delete temporary audio file: {e}")
     elif not is_temp_wav:
-        logger.info(f"  Keeping user-specified synchronized audio file: {args.output_audio}")
-
+         logger.info(f"  Keeping user-specified synchronized audio file: {args.output_audio}")
 
     if not success:
         logger.error(f"Muxing failed.")
@@ -2400,6 +2462,7 @@ Workflow:
     overall_start_time = time.time()
     
     # Professional startup banner
+    logger.info(args)
     logger.info("")
     logger.info("=" * 70)
     logger.info(" AVSync v12 - Audio/Video Synchronization Engine")
