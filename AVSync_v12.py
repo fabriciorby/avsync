@@ -239,6 +239,7 @@ def get_cache_key(args):
         'min_segment_duration': args.min_segment_duration,
         'ref_lang': args.ref_lang,
         'foreign_lang': args.foreign_lang,
+        'match_window_seconds': args.match_window_seconds,
     }
     
     cache_str = json.dumps(cache_params, sort_keys=True)
@@ -959,7 +960,7 @@ def filter_temporal_inconsistency(matches_after_similarity):
     return filtered_list
 
 
-def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_threshold, match_threshold, similarity_threshold):
+def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_threshold, match_threshold, similarity_threshold, match_window_seconds_arg=None):
     """Orchestrates the entire image pairing stage."""
     logger.info("\n===== \1 =====")
     stage_start_time = time.time()
@@ -982,7 +983,11 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
     # --- Step 1.5: Calculate Search Window ---
     logger.info("--- Calculating Frame Match Search Window ---")
     ref_duration = get_file_duration(ref_video_path, media_type='video')
-    if ref_duration is None or ref_duration <= 0:
+    
+    if match_window_seconds_arg is not None:
+        match_search_window_seconds = match_window_seconds_arg
+        logger.info(f"  Using user-specified frame match search window: +/- {match_search_window_seconds:.2f}s")
+    elif ref_duration is None or ref_duration <= 0:
         logger.warning("Could not determine reference video duration or duration is zero. Frame matching will compare against ALL foreign frames.")
         match_search_window_seconds = float('inf') # Effectively disable windowing
     else:
@@ -2401,7 +2406,7 @@ Workflow:
              "Example: '00:00:10:500>00:00:10:800,00:02:00:300>00:02:01:000' creates sync points "
              "at ref 10.5s->foreign 10.8s and ref 120.3s->foreign 121.0s. "
              "These bypass scene detection and are guaranteed sync points.")
-    # Note: Match search window is now calculated automatically, not a direct argument
+    img_group.add_argument("--match_window_seconds", type=float, default=None, help="Manually set the frame match search window in seconds (e.g., 2.0). Overrides the default percentage calculation. Useful for loop sequences.")
 
     # --- Audio Processing Arguments ---
     audio_group = parser.add_argument_group('Audio Processing Parameters')
@@ -2604,7 +2609,8 @@ Workflow:
                 temp_dir=temp_dir,
                 scene_threshold=args.scene_threshold,
                 match_threshold=args.match_threshold,
-                similarity_threshold=args.similarity_threshold
+                similarity_threshold=args.similarity_threshold,
+                match_window_seconds_arg=args.match_window_seconds
             )
             if visual_anchors_details is None:
                 raise RuntimeError("Image Pairing Stage Failed: No visual anchors generated.")
