@@ -244,6 +244,7 @@ ipcMain.handle('run-avsync', async (_event, args: {
   if (args.params.sceneThreshold !== undefined) cmdArgs.push('--scene_threshold', args.params.sceneThreshold.toString());
   if (args.params.matchThreshold !== undefined) cmdArgs.push('--match_threshold', args.params.matchThreshold.toString());
   if (args.params.similarityThreshold !== undefined) cmdArgs.push('--similarity_threshold', args.params.similarityThreshold.toString());
+  if (args.params.matchWindowSeconds !== undefined) cmdArgs.push('--match_window_seconds', args.params.matchWindowSeconds.toString());
   if (args.params.forceSyncPoints) cmdArgs.push('--force_sync_points', args.params.forceSyncPoints);
 
   // Audio parameters

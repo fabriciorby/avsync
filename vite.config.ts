@@ -3,6 +3,11 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 
 export default defineConfig({
+  hmr: false,
+    watch: {
+      usePolling: false,
+      ignored: ['**/*']
+    },
   plugins: [react()],
   base: './',
   publicDir: 'public',

@@ -278,6 +278,25 @@ export default function ParametersPanel({ parameters, onParametersChange }: Para
             <div className="param-section-content">
               <div className="param-item">
                 <label className="param-label">
+                  Match Window (Seconds)
+                  <span className="param-hint">Leave blank for auto</span>
+                </label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={parameters.matchWindowSeconds ?? ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    handleChange('matchWindowSeconds', val === '' ? undefined : parseFloat(val));
+                  }}
+                  className="param-input"
+                  placeholder="Auto"
+                />
+              </div>
+
+              <div className="param-item">
+                <label className="param-label">
                   Scene Threshold
                   <span className="param-hint">0.0 - 1.0 (lower = more changes)</span>
                 </label>

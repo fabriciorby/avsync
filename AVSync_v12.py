@@ -394,37 +394,37 @@ def parse_force_sync_points(force_sync_str):
 def inject_forced_sync_points(visual_anchors_details, forced_sync_points):
     """
     Inject forced sync points into visual_anchors_details list.
-    
-    Forced sync points are given synthetic filenames starting with 'FORCED_SYNC_' 
-    to distinguish them from scene-detected anchors. This prefix is used later
-    to ensure they bypass filtering.
-    
-    Args:
-        visual_anchors_details: List of tuples (ref_filename, foreign_filename, ref_time, foreign_time)
-        forced_sync_points: List of tuples (ref_time, foreign_time)
-    
-    Returns:
-        New list with forced sync points injected, sorted by reference time.
+    Prioritizes forced sync points by removing any existing detected anchors 
+    too close to them (within 1ms).
     """
     if not forced_sync_points:
         return visual_anchors_details
     
     logger.info(f"--- Injecting {len(forced_sync_points)} Forced Sync Points ---")
     
-    # Create a mutable copy
+    # Start with a copy of visual anchors
     combined = list(visual_anchors_details) if visual_anchors_details else []
     
-    # Add forced sync points with synthetic filenames
-    for i, (ref_time, foreign_time) in enumerate(forced_sync_points):
+    # For each forced point, remove any visual anchors that are too close in reference time
+    for i, (f_ref_time, f_foreign_time) in enumerate(forced_sync_points):
+        # Filter out existing anchors that are extremely close to this forced point
+        # (Using 0.001s tolerance to avoid zero-duration segments)
+        original_count = len(combined)
+        combined = [a for a in combined if abs(a[2] - f_ref_time) > 0.001]
+        removed_count = original_count - len(combined)
+        
+        if removed_count > 0:
+            logger.info(f"  > Forced sync point {i+1} at {f_ref_time:.3f}s replaced {removed_count} existing visual anchor(s)")
+
         synthetic_ref_name = f"FORCED_SYNC_{i+1:03d}_ref"
         synthetic_foreign_name = f"FORCED_SYNC_{i+1:03d}_foreign"
-        combined.append((synthetic_ref_name, synthetic_foreign_name, ref_time, foreign_time))
-        logger.info(f"  > Injected forced sync point {i+1}: Ref={format_time(ref_time)} ({ref_time:.3f}s) -> Foreign={format_time(foreign_time)} ({foreign_time:.3f}s)")
+        combined.append((synthetic_ref_name, synthetic_foreign_name, f_ref_time, f_foreign_time))
+        logger.info(f"  > Injected forced sync point {i+1}: Ref={format_time(f_ref_time)} ({f_ref_time:.3f}s) -> Foreign={format_time(f_foreign_time)} ({f_foreign_time:.3f}s)")
     
-    # Sort by reference time (index 2 in the tuple)
+    # Sort by reference time
     combined.sort(key=lambda x: x[2])
     
-    logger.info(f"  -> Total anchors after injection: {len(combined)} ({len(forced_sync_points)} forced + {len(visual_anchors_details) if visual_anchors_details else 0} detected)")
+    logger.info(f"  -> Total anchors after injection: {len(combined)} ({len(forced_sync_points)} forced + {len(combined) - len(forced_sync_points)} detected)")
     
     return combined
 # --- END FORCED SYNC POINT FUNCTIONS ---
@@ -1207,8 +1207,10 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
         last_adjust_ms (float): Milliseconds to adjust last segment (+ pad, - trim).
 
     Returns:
-        str: Path to the final processed segment file meeting the target duration, or None on failure.
+        tuple: (path_to_final_segment, info_dict) or (None, None) on failure.
+               info_dict contains keys: 'clamped', 'padded_ms', 'trimmed_ms'
     """
+    info = {'clamped': False, 'padded_ms': 0.0, 'trimmed_ms': 0.0}
     target_precision_s = target_precision_ms / 1000.0
     
     # --- Apply Manual Adjustments for First/Last Segments ---
@@ -1251,8 +1253,10 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
     
     # Basic validation
     if ref_duration <= 0 or base_foreign_duration <= 0 or foreign_duration <= 0:
-        logger.warning(f"  -> Segment {segment_num}: Invalid duration (Ref={ref_duration:.3f}s, Base={base_foreign_duration:.3f}s, Total={foreign_duration:.3f}s)")
-        return None
+        logger.error(f"  -> Segment {segment_num} FAILURE: Invalid duration (Ref={ref_duration:.3f}s, Base={base_foreign_duration:.3f}s, Total={foreign_duration:.3f}s)")
+        logger.error(f"     Ref boundaries: {ref_duration:.3f}s")
+        logger.error(f"     Foreign boundaries: {foreign_start:.3f}s -> {foreign_end:.3f}s")
+        return None, None
 
     # --- Initial setup ---
     # Initial speed factor estimate
@@ -1347,6 +1351,8 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             dampening = 1.0 - min(0.7, abs(ideal_correction - 1.0) * 1.5)
             dampened_correction = (ideal_correction - 1.0) * dampening + 1.0
             next_speed = clamped_speed * dampened_correction
+            if next_speed < MIN_ATEMPO or next_speed > MAX_ATEMPO:
+                info['clamped'] = True
             clamped_speed = max(MIN_ATEMPO, min(MAX_ATEMPO, next_speed))
             logger.debug(f"    Adjusting speed: IdealCorr={ideal_correction:.6f}x, DampenedCorr={dampened_correction:.6f}x -> NextSpeed={clamped_speed:.6f}x")
             last_processed_duration = processed_duration
@@ -1354,13 +1360,13 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
     # --- Post-Iteration Handling ---
     if best_segment_path is None:
          logger.error(f" Segment {segment_num}: No successful iteration completed.")
-         return None
+         return None, None
 
     # Check the duration of the best segment found
     final_processed_duration = get_file_duration(best_segment_path, media_type='audio')
     if final_processed_duration is None:
         logger.error(f" Segment {segment_num}: Could not get duration of best segment '{os.path.basename(best_segment_path)}'.")
-        return None
+        return None, None
 
     final_duration_gap = ref_duration - final_processed_duration
 
@@ -1378,7 +1384,7 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             ]
             if not run_ffmpeg(silence_cmd, f"Create Silence Pad for Segment {segment_num} ({final_duration_gap:.3f}s)")[0]:
                  logger.error(f" Segment {segment_num}: Failed to create silence pad.")
-                 return None
+                 return None, None
 
             concat_list_path = os.path.join(temp_dir, f"concat_list_{segment_num:04d}.txt")
             try:
@@ -1387,7 +1393,7 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
                     f_concat.write(f"file '{os.path.basename(silence_path)}'\n")
             except IOError as e:
                  logger.error(f" Segment {segment_num}: Failed to write concat list: {e}")
-                 return None
+                 return None, None
 
             concat_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
@@ -1398,9 +1404,10 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             ]
             if not run_ffmpeg(concat_cmd, f"Add Silence Pad to Segment {segment_num}")[0]:
                 logger.error(f" Segment {segment_num}: Failed to concatenate silence pad.")
-                return None
+                return None, None
             logger.info(f"   Segment {segment_num}: Added {final_duration_gap*1000:.1f}ms silence pad for final correction.")
-            return segment_output_path
+            info['padded_ms'] = final_duration_gap * 1000.0
+            return segment_output_path, info
 
         elif final_duration_gap < 0: # Segment is too long, need to trim
             trim_cmd = [
@@ -1412,21 +1419,22 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             ]
             if not run_ffmpeg(trim_cmd, f"Trim Segment {segment_num} to {ref_duration:.3f}s")[0]:
                 logger.error(f" Segment {segment_num}: Failed to trim segment.")
-                return None
+                return None, None
             logger.info(f"   Segment {segment_num}: Trimmed by {abs(final_duration_gap)*1000:.1f}ms for final correction.")
-            return segment_output_path
+            info['trimmed_ms'] = abs(final_duration_gap) * 1000.0
+            return segment_output_path, info
     else:
         # Best iteration was already within precision
         logger.info(f"   Segment {segment_num}: Best iteration duration ({final_processed_duration:.3f}s) already within {target_precision_ms}ms of target.")
         try:
             shutil.copy2(best_segment_path, segment_output_path)
-            return segment_output_path
+            return segment_output_path, info
         except Exception as e:
             logger.error(f" Segment {segment_num}: Failed to copy best segment to final path: {e}")
-            return None
+            return None, None
 
     logger.error(f" Segment {segment_num}: Failed to produce final segment after iterations and correction.")
-    return None
+    return None, None
 def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_path, temp_dir, db_threshold, min_segment_duration):
     """
     Audio sync stage using iterative refinement for precise segment durations.
@@ -1545,8 +1553,40 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     logger.info(f"  > Started with {len(all_anchors)} total anchors (2 audio boundaries + {added_image_count} visual + {added_forced_count} forced).")
     if skipped_outside > 0: logger.info(f"  > Skipped {skipped_outside} visual anchors falling outside audio content boundaries.")
 
+    # --- Filter 0: Monotonicity Filter ---
+    # Ensures that as reference time increases, foreign time also strictly increases.
+    # Forced sync points always take precedence over detected visual anchors.
+    monotonic_anchors = []
+    skipped_monotonic = 0
+    if all_anchors:
+        monotonic_anchors.append(all_anchors[0])
+        for i in range(1, len(all_anchors)):
+            last_ref, last_foreign = monotonic_anchors[-1]
+            curr_ref, curr_foreign = all_anchors[i]
+            
+            if curr_foreign <= last_foreign:
+                # Conflict! Foreign time doesn't increase.
+                is_curr_forced = curr_ref in forced_ref_times
+                if is_curr_forced:
+                    # Current is forced: it wins. Remove previous anchors that conflict.
+                    while len(monotonic_anchors) > 0 and curr_foreign <= monotonic_anchors[-1][1]:
+                        rem_ref, rem_for = monotonic_anchors.pop()
+                        logger.debug(f"    Monotonicity Filter: Forced anchor at {curr_ref:.3f}s REPLACED anchor at {rem_ref:.3f}s (Foreign {curr_foreign:.3f} <= {rem_for:.3f})")
+                        skipped_monotonic += 1
+                    monotonic_anchors.append(all_anchors[i])
+                else:
+                    # Current is NOT forced: it loses if it conflicts with a previously kept anchor.
+                    logger.debug(f"    Monotonicity Filter: Removing anchor at {curr_ref:.3f}s (Foreign {curr_foreign:.3f}s <= Last {last_foreign:.3f}s)")
+                    skipped_monotonic += 1
+            else:
+                monotonic_anchors.append(all_anchors[i])
+    
+    all_anchors = monotonic_anchors
+    if skipped_monotonic > 0: 
+        logger.info(f"  -> Filtered out {skipped_monotonic} anchors breaking temporal monotonicity.")
+
     # --- Filter 1: Minimum Reference Segment Duration ---
-    # NOTE: Forced sync points (in forced_ref_times) bypass this filter
+    # NOTE: Forced sync points bypass this filter, but they also clear out previous non-forced anchors to ensure a clean segment.
     min_ref_dur_filtered_anchors = []
     skipped_short_ref = 0
     if all_anchors:
@@ -1556,17 +1596,27 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             current_ref_time, _ = all_anchors[i]
             segment_ref_duration = current_ref_time - last_kept_ref_time
             
-            # ALWAYS keep forced sync points regardless of segment duration
             is_forced = current_ref_time in forced_ref_times
 
-            # Keep the current anchor if it's forced OR if the segment meets minimum duration
             if is_forced:
+                # Backtrack: clear previous visual anchors if they are too close, to avoid creating micro-segments before the forced point.
+                while len(min_ref_dur_filtered_anchors) > 1: # Protect audio start
+                    prev_ref, _ = min_ref_dur_filtered_anchors[-1]
+                    if (current_ref_time - prev_ref) < min_segment_duration:
+                        if prev_ref not in forced_ref_times:
+                            min_ref_dur_filtered_anchors.pop()
+                            skipped_short_ref += 1
+                            logger.debug(f"    MinRefDur Filter: Removed previous visual anchor (RefT={prev_ref:.3f}) to make room for forced anchor at {current_ref_time:.3f}s")
+                        else:
+                            break # Previous is also a forced point, keep it
+                    else:
+                        break # Enough room
                 min_ref_dur_filtered_anchors.append(all_anchors[i])
-                logger.debug(f"    MinRefDur Filter: KEEPING forced anchor (RefT={current_ref_time:.3f}) despite segment duration ({segment_ref_duration:.3f}s)")
+                logger.debug(f"    MinRefDur Filter: KEEPING forced anchor (RefT={current_ref_time:.3f})")
             elif segment_ref_duration >= min_segment_duration:
                 min_ref_dur_filtered_anchors.append(all_anchors[i])
             elif i < len(all_anchors) - 1: # Don't count removal if it's the segment before the very last anchor
-                logger.debug(f"    MinRefDur Filter: Removing anchor {i} (RefT={current_ref_time:.3f}) because segment duration ({segment_ref_duration:.3f}s) < {min_segment_duration}s")
+                logger.debug(f"    MinRefDur Filter: Removing anchor {i} (RefT={current_ref_time:.3f}) because segment duration ({segment_ref_duration:.3f}) < {min_segment_duration}s")
                 skipped_short_ref += 1
             # else: Anchor is the last one, but segment is too short - keep it anyway to preserve the endpoint
 
@@ -1586,7 +1636,7 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     if min_ref_dur_filtered_anchors:
         fully_filtered_anchors.append(min_ref_dur_filtered_anchors[0]) # Always keep the start anchor
         for i in range(len(min_ref_dur_filtered_anchors) - 1):
-            ref_start, foreign_start = min_ref_dur_filtered_anchors[i]
+            ref_start, foreign_start = fully_filtered_anchors[-1] # Base segment off the last KEPT anchor
             ref_end, foreign_end = min_ref_dur_filtered_anchors[i+1] # Look ahead to the next anchor
 
             ref_seg_duration = ref_end - ref_start
@@ -1691,7 +1741,10 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     target_precision_ms = 5  # Target accuracy in milliseconds
     
     # Track corrections for summary
-    segments_with_corrections = 0
+    segments_clamped = 0
+    total_padded_ms = 0.0
+    total_trimmed_ms = 0.0
+    segments_hard_corrected = 0
 
     # Use progress bar for segment processing (visible on console)
     # Dynamic description shows current segment being processed
@@ -1699,7 +1752,7 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         total=num_segments,
         desc="Processing",
         unit="seg",
-        ncols=80,
+        ncols=100,
         bar_format='{desc}: {bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
         file=sys.stdout,
         dynamic_ncols=False
@@ -1707,7 +1760,7 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
 
     for i in range(num_segments):
         segment_num = i + 1
-        pbar.set_description(f"Segment {segment_num:3d}/{num_segments}")
+        pbar.set_description(f"Processing Segment {segment_num:3d}/{num_segments}")
         ref_start, foreign_start = final_segment_anchors[i]
         ref_end, foreign_end = final_segment_anchors[i+1]
         target_ref_duration = ref_end - ref_start # This is the target duration for the output segment
@@ -1715,7 +1768,7 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         logger.debug(f"Processing Segment {segment_num}/{num_segments}")
 
         # Call the iterative processing function for this segment
-        segment_path = process_segment_iteratively(
+        segment_path, info = process_segment_iteratively(
             foreign_wav_full=foreign_wav_full,
             foreign_start=foreign_start,
             foreign_end=foreign_end,
@@ -1733,6 +1786,13 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         if segment_path and os.path.exists(segment_path):
             processed_segment_files.append(segment_path)
             total_processed_ref_duration += target_ref_duration # Add target duration to total
+            
+            # Record stats
+            if info['clamped']: segments_clamped += 1
+            if info['padded_ms'] > 0 or info['trimmed_ms'] > 0:
+                segments_hard_corrected += 1
+                total_padded_ms += info['padded_ms']
+                total_trimmed_ms += info['trimmed_ms']
         else:
             pbar.close()
             logger.error(f"Failed to process segment {segment_num}. Aborting audio synchronization.")
@@ -1746,7 +1806,28 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     if not processed_segment_files:
          logger.error("No audio segments were successfully processed.")
          return None, None
+         
     logger.info(f"  [OK] Processed {len(processed_segment_files)} segments in {process_elapsed_time:.1f}s")
+    
+    # --- Quality Summary ---
+    logger.info("-" * 40)
+    logger.info("   SYNC QUALITY SUMMARY")
+    logger.info("-" * 40)
+    logger.info(f"   Segments processed     : {num_segments}")
+    logger.info(f"   Speed-limited segments : {segments_clamped} (Speed hit MIN/MAX limits)")
+    logger.info(f"   Hard-corrected segments: {segments_hard_corrected} (Required final trim/pad)")
+    if segments_hard_corrected > 0:
+        logger.info(f"   Total silence added    : {total_padded_ms:.1f}ms")
+        logger.info(f"   Total audio trimmed    : {total_trimmed_ms:.1f}ms")
+    
+    if segments_clamped > (num_segments * 0.2):
+        logger.warning("   [!] HIGH PERCENTAGE OF CLAMPED SEGMENTS: Precision may be lost.")
+        logger.warning(f"       Consider loosening MIN_ATEMPO ({MIN_ATEMPO}) and MAX_ATEMPO ({MAX_ATEMPO}) limits.")
+    
+    if segments_hard_corrected > (num_segments * 0.1):
+        logger.warning("   [!] MANY HARD CORRECTIONS APPLIED: This can cause audible clicks or stutters.")
+        logger.warning("       Try increasing --min_segment_duration to allow for longer, more stable stretches.")
+    logger.info("-" * 40)
 
 
     # --- Step 7: Concatenate Processed Segments ---
